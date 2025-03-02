@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"image"
 	_ "image/jpeg" // Register JPEG decoder
@@ -55,11 +56,21 @@ type MapConfig struct {
 	Reduce   int    `yaml:"reduce"`
 }
 
+// Point represents a point on the map
+type Point struct {
+	Lat  float64
+	Long float64
+}
+
 // MeshtasticTileDownloader is the main application struct
 type MeshtasticTileDownloader struct {
 	config          Config
 	outputDirectory string
 	apiKey          string
+	isPointRadius   bool
+	centerPoint     Point
+	radiusKm        float64
+	detailLevel     int
 }
 
 // NewMeshtasticTileDownloader creates a new tile downloader
@@ -87,27 +98,33 @@ func (m *MeshtasticTileDownloader) LoadConfig(configFile string) error {
 func (m *MeshtasticTileDownloader) ValidateConfig() bool {
 	log.Println("Analysing configuration.")
 
-	// Check zones
-	log.Printf("Found %d zones", len(m.config.Zones))
-	for zoneName, zone := range m.config.Zones {
-		log.Printf("[%s] contains %d regions", zoneName, len(zone.Regions))
+	// When using point-radius mode, we don't need to validate zones
+	if m.isPointRadius {
+		log.Printf("Using point-radius mode: center (%f, %f), radius %f km, detail level %d",
+			m.centerPoint.Lat, m.centerPoint.Long, m.radiusKm, m.detailLevel)
+	} else {
+		// Check zones
+		log.Printf("Found %d zones", len(m.config.Zones))
+		for zoneName, zone := range m.config.Zones {
+			log.Printf("[%s] contains %d regions", zoneName, len(zone.Regions))
 
-		// Set default zoom levels if not specified
-		modified := false
-		if zone.Zoom.In == 0 {
-			zone.Zoom.In = 8
-			modified = true
-			log.Printf("Setting default zoom in level for [%s] to 8", zoneName)
-		}
-		if zone.Zoom.Out == 0 {
-			zone.Zoom.Out = 1
-			modified = true
-			log.Printf("Setting default zoom out level for [%s] to 1", zoneName)
-		}
+			// Set default zoom levels if not specified
+			modified := false
+			if zone.Zoom.In == 0 {
+				zone.Zoom.In = 8
+				modified = true
+				log.Printf("Setting default zoom in level for [%s] to 8", zoneName)
+			}
+			if zone.Zoom.Out == 0 {
+				zone.Zoom.Out = 1
+				modified = true
+				log.Printf("Setting default zoom out level for [%s] to 1", zoneName)
+			}
 
-		// If we modified the zone, update it in the map
-		if modified {
-			m.config.Zones[zoneName] = zone
+			// If we modified the zone, update it in the map
+			if modified {
+				m.config.Zones[zoneName] = zone
+			}
 		}
 	}
 
@@ -201,6 +218,19 @@ func (m *MeshtasticTileDownloader) LongToTileX(lon float64, zoom int) int {
 func (m *MeshtasticTileDownloader) LatToTileY(lat float64, zoom int) int {
 	xyTilesCount := math.Pow(2, float64(zoom))
 	return int(math.Floor(((1.0 - math.Log(math.Tan((lat*math.Pi)/180.0)+1.0/math.Cos((lat*math.Pi)/180.0))/math.Pi) / 2.0) * xyTilesCount))
+}
+
+// TileXToLong converts tile X coordinate to longitude
+func (m *MeshtasticTileDownloader) TileXToLong(x int, zoom int) float64 {
+	xyTilesCount := math.Pow(2, float64(zoom))
+	return (float64(x) / xyTilesCount * 360.0) - 180.0
+}
+
+// TileYToLat converts tile Y coordinate to latitude
+func (m *MeshtasticTileDownloader) TileYToLat(y int, zoom int) float64 {
+	xyTilesCount := math.Pow(2, float64(zoom))
+	n := math.Pi - 2.0*math.Pi*float64(y)/xyTilesCount
+	return 180.0 / math.Pi * math.Atan(0.5*(math.Exp(n)-math.Exp(-n)))
 }
 
 // IsInDebugMode checks if debug mode is enabled
@@ -320,6 +350,76 @@ func (m *MeshtasticTileDownloader) SaveConvertedTile(imgData []byte, destination
 		CompressionLevel: png.BestCompression,
 	}
 	return encoder.Encode(f, img)
+}
+
+// CalculatePointRadiusBounds calculates the bounding box around a point using the Haversine formula
+func (m *MeshtasticTileDownloader) CalculatePointRadiusBounds() (minLat, minLon, maxLat, maxLon float64) {
+	// Earth's radius in kilometers
+	//earthRadius := 6371.0
+
+	// Convert radius from km to degrees (approximate)
+	// 1 degree of latitude is approximately 111.32 km at the equator
+	// 1 degree of longitude varies with latitude
+	latRadius := m.radiusKm / 111.32
+
+	// Longitude degrees per km varies with latitude
+	// cos(lat) gives the scale factor
+	longRadius := m.radiusKm / (111.32 * math.Cos(m.centerPoint.Lat*math.Pi/180.0))
+
+	minLat = m.centerPoint.Lat - latRadius
+	maxLat = m.centerPoint.Lat + latRadius
+	minLon = m.centerPoint.Long - longRadius
+	maxLon = m.centerPoint.Long + longRadius
+
+	// Handle latitude boundary conditions
+	if minLat < -90.0 {
+		minLat = -90.0
+	}
+	if maxLat > 90.0 {
+		maxLat = 90.0
+	}
+
+	// Handle longitude wrap-around
+	if minLon < -180.0 {
+		minLon += 360.0
+	}
+	if maxLon > 180.0 {
+		maxLon -= 360.0
+	}
+
+	return minLat, minLon, maxLat, maxLon
+}
+
+// GetZoomLevelsForDetail returns the appropriate zoom level range based on detail level
+func (m *MeshtasticTileDownloader) GetZoomLevelsForDetail() []int {
+	var minZoom, maxZoom int
+
+	// Map detail level to zoom levels
+	switch m.detailLevel {
+	case 1: // Low detail - good for very large areas
+		minZoom = 6
+		maxZoom = 10
+	case 2: // Medium detail - balanced for regional areas
+		minZoom = 7
+		maxZoom = 12
+	case 3: // High detail - good for cities and towns
+		minZoom = 8
+		maxZoom = 14
+	case 4: // Very high detail - for detailed city navigation
+		minZoom = 9
+		maxZoom = 16
+	default: // Default to medium detail
+		minZoom = 7
+		maxZoom = 12
+	}
+
+	// Create zoom level range
+	zoomLevels := make([]int, 0, maxZoom-minZoom+1)
+	for i := minZoom; i <= maxZoom; i++ {
+		zoomLevels = append(zoomLevels, i)
+	}
+
+	return zoomLevels
 }
 
 // estimateTileSize estimates the average size of a tile at a specific zoom level
@@ -466,6 +566,70 @@ func (m *MeshtasticTileDownloader) ObtainTiles(regions []string, zoomLevels []in
 	return nil
 }
 
+// RunPointRadius executes the tile download process for point-radius mode
+func (m *MeshtasticTileDownloader) RunPointRadius() bool {
+	startTime := time.Now()
+
+	// Calculate bounding box from point and radius
+	minLat, minLon, maxLat, maxLon := m.CalculatePointRadiusBounds()
+	regionStr := fmt.Sprintf("%.6f,%.6f,%.6f,%.6f", minLat, minLon, maxLat, maxLon)
+	regions := []string{regionStr}
+
+	log.Printf("Point-radius mode: center (%.6f, %.6f), radius %.2f km",
+		m.centerPoint.Lat, m.centerPoint.Long, m.radiusKm)
+	log.Printf("Bounding box: %.6f,%.6f,%.6f,%.6f", minLat, minLon, maxLat, maxLon)
+
+	// Get zoom levels based on detail level
+	zoomLevels := m.GetZoomLevelsForDetail()
+	log.Printf("Detail level %d maps to zoom levels %v", m.detailLevel, zoomLevels)
+
+	folderName := fmt.Sprintf("point_%.4f_%.4f_r%.1f_d%d",
+		m.centerPoint.Lat, m.centerPoint.Long, m.radiusKm, m.detailLevel)
+
+	// Create a dedicated output directory for this point
+	pointOutputDir := filepath.Join(m.outputDirectory, folderName)
+	if err := os.MkdirAll(pointOutputDir, 0755); err != nil {
+		log.Printf("Error creating output directory for point: %v", err)
+		return false
+	}
+
+	// Save the bounds to a metadata file
+	metadataPath := filepath.Join(pointOutputDir, "metadata.txt")
+	metadataContent := fmt.Sprintf("Center: %.6f, %.6f\nRadius: %.2f km\nDetail Level: %d\nZoom Levels: %v\nBounding Box: %.6f,%.6f,%.6f,%.6f\nTimestamp: %s\n",
+		m.centerPoint.Lat, m.centerPoint.Long, m.radiusKm, m.detailLevel,
+		zoomLevels, minLat, minLon, maxLat, maxLon, time.Now().Format(time.RFC3339))
+
+	if err := os.WriteFile(metadataPath, []byte(metadataContent), 0644); err != nil {
+		log.Printf("Error writing metadata: %v", err)
+	}
+
+	// Store original output directory
+	originalOutputDir := m.outputDirectory
+	// Set output directory to the point-specific directory
+	m.outputDirectory = pointOutputDir
+
+	if err := m.ObtainTiles(regions, zoomLevels); err != nil {
+		if err.Error() == "download cancelled by user" {
+			log.Println("Download cancelled by user")
+			// Restore original output directory
+			m.outputDirectory = originalOutputDir
+			return true // User cancellation is not an error
+		}
+		log.Printf("Error obtaining tiles: %v", err)
+		// Restore original output directory
+		m.outputDirectory = originalOutputDir
+		return false
+	}
+
+	// Restore original output directory
+	m.outputDirectory = originalOutputDir
+
+	elapsedTime := time.Since(startTime)
+	log.Printf("Total download time: %s", elapsedTime.Round(time.Second))
+
+	return true
+}
+
 // Run executes the tile download process for all configured zones
 func (m *MeshtasticTileDownloader) Run() bool {
 	if !m.IsValidProvider() {
@@ -473,12 +637,17 @@ func (m *MeshtasticTileDownloader) Run() bool {
 		return false
 	}
 
+	// If in point-radius mode, use that instead of the configuration file
+	if m.isPointRadius {
+		return m.RunPointRadius()
+	}
+
 	startTime := time.Now()
 
 	for zoneName, zone := range m.config.Zones {
 		// Create zoom level range
-		zoomLevels := make([]int, 0, zone.Zoom.In-zone.Zoom.Out)
-		for i := zone.Zoom.Out; i < zone.Zoom.In; i++ {
+		zoomLevels := make([]int, 0, zone.Zoom.In-zone.Zoom.Out+1)
+		for i := zone.Zoom.Out; i <= zone.Zoom.In; i++ {
 			zoomLevels = append(zoomLevels, i)
 		}
 
@@ -511,6 +680,18 @@ func (m *MeshtasticTileDownloader) Run() bool {
 }
 
 func main() {
+	// Parse command-line arguments for point-radius mode
+	var lat, long, radius float64
+	var detailLevel int
+	var usePointMode bool
+
+	flag.Float64Var(&lat, "lat", 0, "Center latitude for point-radius mode")
+	flag.Float64Var(&long, "long", 0, "Center longitude for point-radius mode")
+	flag.Float64Var(&radius, "radius", 0, "Radius in kilometers for point-radius mode")
+	flag.IntVar(&detailLevel, "detail", 2, "Detail level (1-4) for point-radius mode")
+	flag.BoolVar(&usePointMode, "point", false, "Enable point-radius mode")
+	flag.Parse()
+
 	// Configure logging
 	if os.Getenv("DEBUG") == "true" {
 		log.Println("Log level is set to DEBUG")
@@ -534,10 +715,43 @@ func main() {
 	}
 	log.Printf("Store destination set at: %s", outputDir)
 
-	// Create app and load config
+	// Create app
 	app := NewMeshtasticTileDownloader(outputDir)
-	if err := app.LoadConfig("config.yaml"); err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+
+	// Check if we're using point-radius mode
+	if usePointMode {
+		if lat == 0 && long == 0 {
+			log.Fatal("Error: When using point mode, you must specify lat and long parameters")
+		}
+
+		if radius <= 0 {
+			log.Fatal("Error: Radius must be greater than 0")
+		}
+
+		if detailLevel < 1 || detailLevel > 4 {
+			log.Printf("Warning: Detail level %d is out of range (1-4), using default level 2", detailLevel)
+			detailLevel = 2
+		}
+
+		// Set point-radius mode parameters
+		app.isPointRadius = true
+		app.centerPoint = Point{Lat: lat, Long: long}
+		app.radiusKm = radius
+		app.detailLevel = detailLevel
+
+		// Still need to load config for map provider settings
+		if err := app.LoadConfig("config.yaml"); err != nil {
+			log.Printf("Warning: Failed to load configuration: %v. Using defaults.", err)
+			// Set some sensible defaults
+			app.config.Map.Provider = "thunderforest"
+			app.config.Map.Style = "atlas"
+			app.config.Map.Reduce = 12
+		}
+	} else {
+		// Regular mode - load config
+		if err := app.LoadConfig("config.yaml"); err != nil {
+			log.Fatalf("Failed to load configuration: %v", err)
+		}
 	}
 
 	// Validate config
