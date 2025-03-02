@@ -1,0 +1,33 @@
+# Meshtastic Tile Downloader Configuration
+zones:
+  Europe:
+    regions:
+      - 30.0,-15.0,60.0,50.8
+    zoom:
+      out: 1
+      in: 8
+  # Vigo (Spain):
+  #   zoom:
+  #     out: 10
+  #     in: 16
+  #   regions:
+  #     - 42.24285,-8.78276,42.20617,-8.67122
+  # Coruña (Spain):
+  #   zoom:
+  #     out: 10
+  #     in: 14
+  #   regions:
+  #     - 43.39103,-8.45354,43.33636,-8.37160
+  # Portugal:
+  #   zoom:
+  #     out: 1
+  #     in: 13
+  #   regions:
+  #     - 42.28,-9.96,36.79,-6.50    # Continente
+  #     - 39.90,-31.47,36.89,-24.95  # Acores
+  #     - 33.27,-17.40,32.32,-16.04  # Madeira
+map:
+  style: atlas  # make it match your provider!
+  provider: thunderforest  # valid providers: geoapify, thunderforest, cnig.es (Spain; no token needed)
+  # reducing size is a good practice for small screens and easier on SDcard storage, faster copying and reading.
+  reduce: 12  # reduce image quality to 8bits from this level and on (default: 12. set 0 for no reduction; 1 for all)
