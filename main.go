@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/schollz/progressbar/v3"
 	"gopkg.in/yaml.v3"
@@ -249,12 +250,7 @@ func (m *MeshtasticTileDownloader) DownloadTile(zoom, x, y int) error {
 	if err != nil {
 		return fmt.Errorf("failed to download: %w", err)
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-
-		}
-	}(resp.Body)
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to download tile %d/%d/%d: %d %s", zoom, x, y, resp.StatusCode, resp.Status)
@@ -297,12 +293,7 @@ func (m *MeshtasticTileDownloader) ReduceTile(imgData []byte, destination string
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
-	defer func(f *os.File) {
-		err := f.Close()
-		if err != nil {
-
-		}
-	}(f)
+	defer f.Close()
 
 	// Use png encoder with best compression
 	encoder := png.Encoder{
@@ -322,12 +313,7 @@ func (m *MeshtasticTileDownloader) SaveConvertedTile(imgData []byte, destination
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
-	defer func(f *os.File) {
-		err := f.Close()
-		if err != nil {
-
-		}
-	}(f)
+	defer f.Close()
 
 	// Use png encoder with best compression
 	encoder := png.Encoder{
@@ -336,11 +322,51 @@ func (m *MeshtasticTileDownloader) SaveConvertedTile(imgData []byte, destination
 	return encoder.Encode(f, img)
 }
 
+// estimateTileSize estimates the average size of a tile at a specific zoom level
+func (m *MeshtasticTileDownloader) estimateTileSize(zoom int) int64 {
+	// These are rough estimates based on average tile sizes
+	// Size generally increases with zoom level as tiles contain more detail
+	switch {
+	case zoom <= 5:
+		return 20 * 1024 // ~20KB for very low zoom levels
+	case zoom <= 8:
+		return 30 * 1024 // ~30KB for low zoom levels
+	case zoom <= 11:
+		return 50 * 1024 // ~50KB for medium zoom levels
+	case zoom <= 14:
+		return 80 * 1024 // ~80KB for high zoom levels
+	default:
+		return 120 * 1024 // ~120KB for very high zoom levels
+	}
+}
+
+// formatSize formats a byte size to a human-readable string (KB, MB, GB)
+func formatSize(bytes int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.2f KB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%d bytes", bytes)
+	}
+}
+
 // ObtainTiles downloads all tiles for the given regions and zoom levels
 func (m *MeshtasticTileDownloader) ObtainTiles(regions []string, zoomLevels []int) error {
 	totalTiles := 0
+	estimatedSize := int64(0)
+	tileCountByZoom := make(map[int]int)
 
-	// Calculate total tiles first for progress bar
+	// Calculate total tiles first for progress bar and size estimation
 	for _, zoom := range zoomLevels {
 		for _, region := range regions {
 			coords := strings.Split(region, ",")
@@ -377,7 +403,29 @@ func (m *MeshtasticTileDownloader) ObtainTiles(regions []string, zoomLevels []in
 
 			tilesX := maxX - minX + 1
 			tilesY := maxY - minY + 1
-			totalTiles += tilesX * tilesY
+			tilesInZoom := tilesX * tilesY
+
+			tileCountByZoom[zoom] += tilesInZoom
+			totalTiles += tilesInZoom
+		}
+	}
+
+	// Calculate estimated size
+	for zoom, count := range tileCountByZoom {
+		zoomSize := int64(count) * m.estimateTileSize(zoom)
+		estimatedSize += zoomSize
+		log.Printf("Zoom level %d: %d tiles, estimated %s", zoom, count, formatSize(zoomSize))
+	}
+
+	log.Printf("Total tiles: %d, Estimated download size: %s", totalTiles, formatSize(estimatedSize))
+
+	// Ask for confirmation if size is large
+	if estimatedSize > 100*1024*1024 { // 100MB
+		fmt.Printf("\nWarning: The estimated download size is %s. Continue? (y/n): ", formatSize(estimatedSize))
+		var answer string
+		fmt.Scanln(&answer)
+		if strings.ToLower(answer) != "y" && strings.ToLower(answer) != "yes" {
+			return fmt.Errorf("download cancelled by user")
 		}
 	}
 
@@ -425,6 +473,8 @@ func (m *MeshtasticTileDownloader) Run() bool {
 		return false
 	}
 
+	startTime := time.Now()
+
 	for zoneName, zone := range m.config.Zones {
 		// Create zoom level range
 		zoomLevels := make([]int, 0, zone.Zoom.In-zone.Zoom.Out)
@@ -436,12 +486,19 @@ func (m *MeshtasticTileDownloader) Run() bool {
 			zoneName, zone.Zoom.Out, zone.Zoom.In, zone.Regions)
 
 		if err := m.ObtainTiles(zone.Regions, zoomLevels); err != nil {
+			if err.Error() == "download cancelled by user" {
+				log.Printf("Download cancelled by user for zone %s", zoneName)
+				return true // User cancellation is not an error
+			}
 			log.Printf("Error obtaining tiles for zone %s: %v", zoneName, err)
 			return false
 		}
 
 		log.Printf("Finished with zone %s", zoneName)
 	}
+
+	elapsedTime := time.Since(startTime)
+	log.Printf("Total download time: %s", elapsedTime.Round(time.Second))
 
 	// List all processed zones
 	zoneNames := make([]string, 0, len(m.config.Zones))
