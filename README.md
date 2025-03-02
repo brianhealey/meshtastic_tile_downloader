@@ -89,8 +89,8 @@ Each zone contains:
 ## Credits
 
 Based on the Python implementation by:
-- DRoBeR (Meshtastic Spain community)
-- pcamelo (Meshtastic Portugal community)
+- @droberin (Meshtastic Spain community) https://gist.github.com/droberin/b333a216d860361e329e74f59f4af4ba
+- @pcamelo (Meshtastic Portugal community)
 
 Map providers:
 - Thunderforest: Maps © www.thunderforest.com, Data © www.osm.org/copyright
